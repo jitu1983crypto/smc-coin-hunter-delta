@@ -1,278 +1,542 @@
 import time
 from datetime import datetime, timezone
-import requests
+
 import pandas as pd
+import requests
 import streamlit as st
 
-BASE = "https://api.india.delta.exchange"
-HEADERS = {"Accept": "application/json", "User-Agent": "SMC-Coin-Hunter/0.1"}
-st.set_page_config(page_title="SMC Coin Hunter | Delta", page_icon="🛰️", layout="wide")
+# ==========================================
+# SMC COIN HUNTER PRO
+# Delta Exchange market scanner
+# ==========================================
 
-st.title("🛰️ SMC Coin Hunter Pro — Delta Exchange")
-st.caption("Market scanner • SMC-inspired rules • 1H setup + 4H trend • paper signals only")
-
-st.warning(
-    "Research tool only: signals are unvalidated candidates, not financial advice or guaranteed-profit calls. "
-    "This build does not place orders and does not need your API key."
+st.set_page_config(
+    page_title="SMC Coin Hunter Pro",
+    page_icon="📊",
+    layout="wide"
 )
 
-@st.cache_data(ttl=60, show_spinner=False)
+API = "https://api.india.delta.exchange"
+
+st.title("🎯 SMC Coin Hunter Pro")
+st.caption(
+    "Delta Exchange | Multi-timeframe market scanner"
+)
+
+st.warning(
+    "Analysis only. Signals are not guaranteed to be "
+    "profitable. Verify prices and market conditions "
+    "before making any trading decision."
+)
+
+# ==========================================
+# REFRESH CONTROLS
+# ==========================================
+
+if st.button("🔄 Refresh Market Data"):
+    st.cache_data.clear()
+    st.rerun()
+
+st.caption(
+    "Time shown in UTC. Refresh the scanner to request "
+    "new market data."
+)
+
+# ==========================================
+# API REQUEST
+# ==========================================
+
+@st.cache_data(ttl=20, show_spinner=False)
 def api_get(path, params=None):
-    r = requests.get(BASE + path, params=params or {}, headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    if isinstance(data, dict) and data.get("success") is False:
-        raise RuntimeError(str(data.get("error", "Delta API returned success=false")))
+    response = requests.get(
+        API + path,
+        params=params,
+        headers={"Accept": "application/json"},
+        timeout=15
+    )
+    response.raise_for_status()
+
+    data = response.json()
+
+    if data.get("success") is False:
+        raise ValueError("Delta Exchange API returned an error.")
+
     return data
 
-def result_list(payload):
-    result = payload.get("result", []) if isinstance(payload, dict) else payload
-    return result if isinstance(result, list) else []
+
+# ==========================================
+# LOAD LIVE PRODUCTS
+# ==========================================
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_products():
-    payload = api_get("/v2/products", {"page_size": 200})
-    rows = result_list(payload)
-    # Try additional pages where a cursor is available, but cap calls for safety.
-    cursor = (payload.get("meta") or {}).get("after") if isinstance(payload, dict) else None
-    pages = 0
-    while cursor and pages < 4:
-        payload2 = api_get("/v2/products", {"page_size": 200, "after": cursor})
-        rows.extend(result_list(payload2))
-        cursor = (payload2.get("meta") or {}).get("after") if isinstance(payload2, dict) else None
-        pages += 1
-    out = []
-    for p in rows:
-        if not isinstance(p, dict):
-            continue
-        ptype = str(p.get("contract_type", p.get("product_type", ""))).lower()
-        state = str(p.get("state", "")).lower()
-        symbol = str(p.get("symbol", ""))
-        status = str(p.get("trading_status", "operational")).lower()
-        if symbol and ("perpetual" in ptype) and (state in ("live", "")) and status == "operational":
-            out.append({
-                "symbol": symbol,
-                "description": p.get("description", p.get("underlying_asset", symbol)),
-                "product_id": p.get("id"),
-            })
-    return out
+    products = []
+    cursor = None
 
-@st.cache_data(ttl=45, show_spinner=False)
-def get_tickers():
-    payload = api_get("/v2/tickers")
-    rows = result_list(payload)
-    data = {}
-    for t in rows:
-        if not isinstance(t, dict):
-            continue
-        symbol = t.get("symbol")
-        if symbol:
-            data[str(symbol)] = t
-    return data
-
-@st.cache_data(ttl=45, show_spinner=False)
-def get_candles(symbol, resolution, bars=100):
-    now = int(time.time())
-    secs = 3600 if resolution == "1h" else 14400
-    start = now - secs * (bars + 3)
-    payload = api_get("/v2/history/candles", {
-        "resolution": resolution, "symbol": symbol, "start": start, "end": now
-    })
-    rows = result_list(payload)
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows)
-    required = ["time", "open", "high", "low", "close"]
-    if not all(c in df.columns for c in required):
-        return pd.DataFrame()
-    for c in ["open", "high", "low", "close", "volume"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=["open", "high", "low", "close"]).sort_values("time").drop_duplicates("time")
-    # Exclude the newest candle because it may still be forming.
-    if len(df) > 2:
-        df = df.iloc[:-1].copy()
-    return df.tail(bars).reset_index(drop=True)
-
-def analyse(symbol):
-    try:
-        h1 = get_candles(symbol, "1h", 100)
-        h4 = get_candles(symbol, "4h", 80)
-        if len(h1) < 30 or len(h4) < 25:
-            return None
-        # Higher-timeframe trend filter
-        h4c = h4["close"]
-        ema20 = h4c.ewm(span=20, adjust=False).mean()
-        ema50 = h4c.ewm(span=50, adjust=False).mean()
-        if len(ema50) < 25:
-            return None
-        if h4c.iloc[-1] > ema20.iloc[-1] and ema20.iloc[-1] > ema50.iloc[-1]:
-            bias = "Bullish"
-        elif h4c.iloc[-1] < ema20.iloc[-1] and ema20.iloc[-1] < ema50.iloc[-1]:
-            bias = "Bearish"
-        else:
-            bias = "Mixed"
-
-        last = h1.iloc[-1]
-        prev = h1.iloc[-2]
-        prior = h1.iloc[-13:-1]
-        prior_high = float(prior["high"].max())
-        prior_low = float(prior["low"].min())
-        close = float(last["close"])
-        high = float(last["high"])
-        low = float(last["low"])
-        # Approximate structure breaks using previous 12 completed bars.
-        bull_bos = close > prior_high
-        bear_bos = close < prior_low
-        # Liquidity sweep: wick takes prior range and candle closes back inside.
-        sweep_low = low < prior_low and close > prior_low
-        sweep_high = high > prior_high and close < prior_high
-        # 3-candle FVG: gap between candle 1 and candle 3.
-        a = h1.iloc[-3]
-        bull_fvg = float(last["low"]) > float(a["high"])
-        bear_fvg = float(last["high"]) < float(a["low"])
-        bull_gap_low, bull_gap_high = (float(a["high"]), low) if bull_fvg else (None, None)
-        bear_gap_low, bear_gap_high = (high, float(a["low"])) if bear_fvg else (None, None)
-        # Recent FVG retest / overlap.
-        bull_retest = False
-        bear_retest = False
-        if bull_fvg:
-            bull_retest = low <= bull_gap_high and high >= bull_gap_low
-        if bear_fvg:
-            bear_retest = low <= bear_gap_high and high >= bear_gap_low
-        # Also inspect recent gaps for retests to avoid requiring a gap only on the latest bar.
-        for i in range(max(2, len(h1)-12), len(h1)):
-            c = h1.iloc[i]
-            older = h1.iloc[i-2]
-            if float(c["low"]) > float(older["high"]):
-                gl, gh = float(older["high"]), float(c["low"])
-                if low <= gh and high >= gl:
-                    bull_retest = True
-            if float(c["high"]) < float(older["low"]):
-                gl, gh = float(c["high"]), float(older["low"])
-                if low <= gh and high >= gl:
-                    bear_retest = True
-
-        vol = float(last["volume"]) if "volume" in h1.columns and pd.notna(last.get("volume")) else 0.0
-        vol_mean = float(h1["volume"].tail(20).mean()) if "volume" in h1.columns else 0.0
-        vol_confirm = bool(vol_mean > 0 and vol >= vol_mean)
-        score_long = (20 if bias == "Bullish" else 0) + (25 if bull_bos else 0) + (20 if sweep_low else 0) + (15 if bull_fvg else 0) + (10 if bull_retest else 0) + (10 if vol_confirm else 0)
-        score_short = (20 if bias == "Bearish" else 0) + (25 if bear_bos else 0) + (20 if sweep_high else 0) + (15 if bear_fvg else 0) + (10 if bear_retest else 0) + (10 if vol_confirm else 0)
-
-        side, score = "WAIT", max(score_long, score_short)
-        if score_long >= 60 and score_long > score_short:
-            side = "BUY candidate"
-        elif score_short >= 60 and score_short > score_long:
-            side = "SELL candidate"
-
-        # ATR-like recent range for an indicative stop; not an order instruction.
-        tr = (h1["high"] - h1["low"]).tail(14)
-        atr = float(tr.mean()) if len(tr) else close * 0.01
-        if side == "BUY candidate":
-            stop = min(float(h1["low"].tail(8).min()), close - atr)
-            risk = max(close - stop, close * 0.002)
-            t1, t2 = close + 1.5*risk, close + 2*risk
-            zone = f"{min(close, bull_gap_low) if bull_gap_low else close:.6g} – {max(close, bull_gap_high) if bull_gap_high else close:.6g}"
-        elif side == "SELL candidate":
-            stop = max(float(h1["high"].tail(8).max()), close + atr)
-            risk = max(stop - close, close * 0.002)
-            t1, t2 = close - 1.5*risk, close - 2*risk
-            zone = f"{min(close, bear_gap_low) if bear_gap_low else close:.6g} – {max(close, bear_gap_high) if bear_gap_high else close:.6g}"
-        else:
-            stop = t1 = t2 = None
-            zone = "Wait for confirmation"
-
-        setup = []
-        if bull_bos or bear_bos: setup.append("BOS")
-        if sweep_low: setup.append("Sell-side sweep")
-        if sweep_high: setup.append("Buy-side sweep")
-        if bull_fvg: setup.append("Bullish FVG")
-        if bear_fvg: setup.append("Bearish FVG")
-        if bull_retest or bear_retest: setup.append("FVG retest")
-        if vol_confirm: setup.append("Volume")
-        return {
-            "Coin": symbol, "Direction": side, "Score": int(score), "4H bias": bias,
-            "Price": close, "Entry zone (indicative)": zone,
-            "Stop (indicative)": stop, "Target 1": t1, "Target 2": t2,
-            "Setup checks": ", ".join(setup) if setup else "No complete setup",
-            "1H candle time": datetime.fromtimestamp(int(last["time"]), timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    for _ in range(10):
+        params = {
+            "states": "live",
+            "page_size": 100
         }
-    except Exception:
+
+        if cursor:
+            params["after"] = cursor
+
+        data = api_get("/v2/products", params)
+        products.extend(data.get("result", []))
+
+        meta = data.get("meta", {})
+        next_cursor = meta.get("after")
+
+        if not next_cursor or next_cursor == cursor:
+            break
+
+        cursor = next_cursor
+
+    return products
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def get_tickers():
+    data = api_get("/v2/tickers")
+    return data.get("result", [])
+
+
+# ==========================================
+# FIND MAIN MARKETS
+# ==========================================
+
+ASSETS = {
+    "Bitcoin": ["BTC"],
+    "Ethereum": ["ETH"],
+    "Solana": ["SOL"],
+    "Gold": ["XAU", "GOLD"],
+    "Silver": ["XAG", "SILVER"]
+}
+
+
+def matches_asset(product, asset):
+    symbol = str(product.get("symbol", "")).upper()
+    underlying = str(
+        product.get("underlying_asset", "")
+    ).upper()
+
+    names = ASSETS[asset]
+
+    for name in names:
+        if (
+            symbol.startswith(name)
+            or underlying == name
+        ):
+            return True
+
+    return False
+
+
+def choose_product(products, asset):
+    candidates = [
+        p for p in products
+        if matches_asset(p, asset)
+    ]
+
+    # Prefer live perpetual futures, then spot.
+    def rank(p):
+        contract = str(
+            p.get("contract_type", "")
+        ).lower()
+
+        symbol = str(p.get("symbol", "")).upper()
+
+        if contract == "perpetual_futures":
+            return 0
+        if contract == "spot":
+            return 1
+        if "PERPETUAL" in symbol:
+            return 2
+
+        return 3
+
+    candidates.sort(key=rank)
+
+    if not candidates:
         return None
 
-with st.sidebar:
-    st.header("Scanner settings")
-    market_count = st.slider("Markets to scan (top by 24h turnover)", 5, 40, 15, 5)
-    min_score = st.slider("Minimum score to highlight", 40, 90, 60, 5)
-    st.caption("The scan uses completed candles and public market data.")
-    refresh = st.button("🔄 Refresh / scan now", type="primary", use_container_width=True)
-    st.divider()
-    st.caption("Build 0.1 • No trading API key • No order execution")
+    # Prefer an exact base-asset match.
+    preferred = {
+        "Bitcoin": ["BTCUSD", "BTC_INR"],
+        "Ethereum": ["ETHUSD", "ETH_INR"],
+        "Solana": ["SOLUSD", "SOL_INR"],
+        "Gold": ["XAUUSD", "GOLDUSD"],
+        "Silver": ["XAGUSD", "SILVERUSD"]
+    }
 
-st.write("### Market scan")
-if refresh:
-    st.cache_data.clear()
+    for symbol in preferred[asset]:
+        for p in candidates:
+            if str(p.get("symbol", "")).upper() == symbol:
+                return p
 
-try:
-    with st.spinner("Loading Delta Exchange markets and tickers…"):
-        products = get_products()
-        tickers = get_tickers()
-    if not products:
-        st.error("No perpetual futures were returned by the product endpoint. Check API status or endpoint response.")
-        st.stop()
+    return candidates[0]
 
-    ranked = []
-    for p in products:
-        t = tickers.get(p["symbol"], {})
-        turnover = t.get("turnover_24h", t.get("turnover", t.get("volume", 0)))
-        try: turnover = float(turnover or 0)
-        except (TypeError, ValueError): turnover = 0.0
-        ranked.append({**p, "turnover": turnover, "ticker": t})
-    ranked.sort(key=lambda x: x["turnover"], reverse=True)
-    chosen = ranked[:market_count]
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Eligible perpetual markets", len(products))
-    c2.metric("Markets selected", len(chosen))
-    c3.metric("Scan time (UTC)", datetime.now(timezone.utc).strftime("%H:%M:%S"))
+# ==========================================
+# GET CANDLE DATA
+# ==========================================
 
-    rows = []
-    progress = st.progress(0, text="Scanning SMC conditions…")
-    for i, p in enumerate(chosen):
-        item = analyse(p["symbol"])
-        if item:
-            item["24h turnover"] = p["turnover"]
-            rows.append(item)
-        progress.progress((i+1)/len(chosen), text=f"Analysing {p['symbol']} ({i+1}/{len(chosen)})")
-    progress.empty()
+@st.cache_data(ttl=20, show_spinner=False)
+def get_candles(symbol, resolution, count=120):
+    now = int(time.time())
+
+    seconds = {
+        "15m": 900,
+        "1h": 3600,
+        "4h": 14400
+    }[resolution]
+
+    start = now - (count + 5) * seconds
+
+    data = api_get(
+        "/v2/history/candles",
+        {
+            "resolution": resolution,
+            "symbol": symbol,
+            "start": start,
+            "end": now
+        }
+    )
+
+    rows = data.get("result", [])
 
     if not rows:
-        st.warning("No usable candle sets were returned. Try refreshing later; this may be an API/data issue.")
-    else:
-        df = pd.DataFrame(rows)
-        df["Priority"] = df.apply(lambda r: "HIGH" if r["Score"] >= min_score and r["Direction"] != "WAIT" else ("WATCH" if r["Score"] >= 40 else "LOW"), axis=1)
-        df = df.sort_values(["Score", "24h turnover"], ascending=[False, False])
-        top = df[(df["Score"] >= min_score) & (df["Direction"] != "WAIT")]
-        a, b, c = st.columns(3)
-        a.metric("BUY candidates", int((top["Direction"] == "BUY candidate").sum()))
-        b.metric("SELL candidates", int((top["Direction"] == "SELL candidate").sum()))
-        c.metric("High-priority setups", len(top))
-        st.dataframe(
-            df[["Priority","Coin","Direction","Score","4H bias","Price","Entry zone (indicative)","Stop (indicative)","Target 1","Target 2","Setup checks","24h turnover","1H candle time"]],
-            use_container_width=True, hide_index=True
-        )
-        st.download_button("⬇️ Download scan as CSV", df.to_csv(index=False).encode("utf-8"), "smc_coin_hunter_scan.csv", "text/csv")
-        st.subheader("Highest-ranked candidates")
-        if top.empty:
-            st.info("No setup passed your current score threshold. WAIT is a valid result.")
-        else:
-            st.dataframe(top[["Coin","Direction","Score","4H bias","Price","Entry zone (indicative)","Stop (indicative)","Target 1","Target 2","Setup checks"]], use_container_width=True, hide_index=True)
-        st.caption("Scores are rule-based confluence points, not win probabilities. Stops/targets are rough research estimates, before fees, slippage, funding, contract sizing and exchange-specific risk checks.")
-except requests.RequestException as e:
-    st.error(f"Could not connect to Delta Exchange public API: {e}")
-    st.info("Confirm your deployment can access api.india.delta.exchange and retry.")
-except Exception as e:
-    st.error(f"Scanner error: {e}")
+        return pd.DataFrame()
 
-st.divider()
-st.caption("Next build steps: validate the SMC rules against historical data, record signal outcomes, add configurable notifications, and only then consider paper trading. Do not add exchange trading credentials to this scanner.")
+    df = pd.DataFrame(rows)
+
+    required = [
+        "time", "open", "high",
+        "low", "close", "volume"
+    ]
+
+    if not all(c in df.columns for c in required):
+        return pd.DataFrame()
+
+    for col in [
+        "open", "high", "low", "close", "volume"
+    ]:
+        df[col] = pd.to_numeric(
+            df[col], errors="coerce"
+        )
+
+    df["time"] = pd.to_numeric(
+        df["time"], errors="coerce"
+    )
+
+    df = df.dropna(
+        subset=["time", "open", "high", "low", "close"]
+    )
+
+    df = df.sort_values("time").drop_duplicates(
+        subset=["time"]
+    )
+
+    return df.tail(count).reset_index(drop=True)
+
+
+# ==========================================
+# TECHNICAL ANALYSIS
+# ==========================================
+
+def analyse(df):
+    if len(df) < 55:
+        return {
+            "trend": "INSUFFICIENT DATA",
+            "signal": "WAIT",
+            "fvg": "Not available",
+            "liquidity_high": None,
+            "liquidity_low": None,
+            "close": None,
+            "candle_time": None
+        }
+
+    close = df["close"]
+
+    ema20 = close.ewm(
+        span=20, adjust=False
+    ).mean()
+
+    ema50 = close.ewm(
+        span=50, adjust=False
+    ).mean()
+
+    last = len(df) - 1
+
+    if ema20.iloc[last] > ema50.iloc[last]:
+        trend = "BULLISH"
+    elif ema20.iloc[last] < ema50.iloc[last]:
+        trend = "BEARISH"
+    else:
+        trend = "NEUTRAL"
+
+    # Three-candle Fair Value Gap detection.
+    recent = df.tail(30).reset_index(drop=True)
+
+    bullish_gaps = []
+    bearish_gaps = []
+
+    for i in range(2, len(recent)):
+        first = recent.iloc[i - 2]
+        third = recent.iloc[i]
+
+        if third["low"] > first["high"]:
+            bullish_gaps.append(
+                (first["high"], third["low"])
+            )
+
+        if third["high"] < first["low"]:
+            bearish_gaps.append(
+                (third["high"], first["low"])
+            )
+
+    if bullish_gaps and bearish_gaps:
+        fvg_text = (
+            f"Bullish: {len(bullish_gaps)} | "
+            f"Bearish: {len(bearish_gaps)}"
+        )
+    elif bullish_gaps:
+        fvg_text = f"Bullish: {len(bullish_gaps)}"
+    elif bearish_gaps:
+        fvg_text = f"Bearish: {len(bearish_gaps)}"
+    else:
+        fvg_text = "No recent FVG detected"
+
+    # Recent swing levels: potential liquidity areas.
+    liquidity_high = float(
+        df["high"].iloc[-21:-1].max()
+    )
+
+    liquidity_low = float(
+        df["low"].iloc[-21:-1].min()
+    )
+
+    # Use completed candles for break detection.
+    previous_high = float(
+        df["high"].iloc[-11:-1].max()
+    )
+
+    previous_low = float(
+        df["low"].iloc[-11:-1].min()
+    )
+
+    previous_close = float(df["close"].iloc[-2])
+    current_close = float(df["close"].iloc[-1])
+
+    bullish_break = (
+        current_close > previous_high
+        and previous_close <= previous_high
+    )
+
+    bearish_break = (
+        current_close < previous_low
+        and previous_close >= previous_low
+    )
+
+    signal = "WAIT"
+
+    if bullish_break and trend == "BULLISH":
+        signal = "BUY WATCH"
+
+    elif bearish_break and trend == "BEARISH":
+        signal = "SELL WATCH"
+
+    return {
+        "trend": trend,
+        "signal": signal,
+        "fvg": fvg_text,
+        "liquidity_high": liquidity_high,
+        "liquidity_low": liquidity_low,
+        "close": current_close,
+        "candle_time": int(df["time"].iloc[-1])
+    }
+
+
+# ==========================================
+# DISPLAY MAIN MARKETS
+# ==========================================
+
+try:
+    with st.spinner("Loading Delta Exchange markets..."):
+        products = get_products()
+        tickers = get_tickers()
+
+    ticker_map = {
+        str(t.get("symbol", "")).upper(): t
+        for t in tickers
+    }
+
+    market_results = []
+
+    for asset in ASSETS:
+        product = choose_product(products, asset)
+
+        if product is None:
+            market_results.append({
+                "Asset": asset,
+                "Symbol": "Not found",
+                "Price": "Unavailable",
+                "15m": "WAIT",
+                "1H": "WAIT",
+                "4H": "WAIT",
+                "Status": "No matching live contract"
+            })
+            continue
+
+        symbol = str(product.get("symbol", ""))
+        ticker = ticker_map.get(symbol.upper(), {})
+
+        price = (
+            ticker.get("mark_price")
+            or ticker.get("close")
+            or ticker.get("spot_price")
+        )
+
+        result = {
+            "Asset": asset,
+            "Symbol": symbol,
+            "Price": (
+                float(price)
+                if price is not None
+                else None
+            ),
+            "Status": "Checking candles"
+        }
+
+        analyses = {}
+
+        for tf in ["15m", "1h", "4h"]:
+            try:
+                df = get_candles(symbol, tf)
+
+                # Exclude the currently forming candle.
+                if len(df) > 1:
+                    df = df.iloc[:-1].reset_index(drop=True)
+
+                analyses[tf] = analyse(df)
+
+            except Exception:
+                analyses[tf] = {
+                    "trend": "DATA ERROR",
+                    "signal": "WAIT",
+                    "fvg": "Unavailable",
+                    "liquidity_high": None,
+                    "liquidity_low": None,
+                    "close": None,
+                    "candle_time": None
+                }
+
+        a15 = analyses["15m"]
+        a1h = analyses["1h"]
+        a4h = analyses["4h"]
+
+        # Conservative multi-timeframe confirmation.
+        signal = "WAIT"
+
+        if (
+            a15["signal"] == "BUY WATCH"
+            and a1h["trend"] == "BULLISH"
+            and a4h["trend"] == "BULLISH"
+        ):
+            signal = "BUY WATCH"
+
+        elif (
+            a15["signal"] == "SELL WATCH"
+            and a1h["trend"] == "BEARISH"
+            and a4h["trend"] == "BEARISH"
+        ):
+            signal = "SELL WATCH"
+
+        candle_time = a15.get("candle_time")
+
+        if candle_time is None:
+            status = "Candle data unavailable"
+        else:
+            age = time.time() - candle_time
+
+            if age > 1800:
+                status = "STALE DATA - DO NOT USE"
+            else:
+                status = "Candle data received"
+
+        market_results.append({
+            "Asset": asset,
+            "Symbol": symbol,
+            "Price": result["Price"],
+            "15m": a15["trend"],
+            "1H": a1h["trend"],
+            "4H": a4h["trend"],
+            "Signal": signal,
+            "FVG (15m)": a15["fvg"],
+            "Liquidity High": a15["liquidity_high"],
+            "Liquidity Low": a15["liquidity_low"],
+            "Last Candle UTC": (
+                datetime.fromtimestamp(
+                    candle_time, timezone.utc
+                ).strftime("%Y-%m-%d %H:%M")
+                if candle_time is not None
+                else "Unavailable"
+            ),
+            "Status": status
+        })
+
+    st.subheader("📊 Main Market Scanner")
+
+    st.dataframe(
+        pd.DataFrame(market_results),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.subheader("🔎 Individual Market Analysis")
+
+    for item in market_results:
+        with st.expander(
+            f"{item['Asset']} — {item['Symbol']}"
+        ):
+            st.write("Price:", item["Price"])
+            st.write("15-minute trend:", item["15m"])
+            st.write("1-hour trend:", item["1H"])
+            st.write("4-hour trend:", item["4H"])
+            st.write("Signal:", item.get("Signal", "WAIT"))
+            st.write("FVG:", item.get("FVG (15m)", "Unavailable"))
+            st.write(
+                "Potential liquidity high:",
+                item.get("Liquidity High")
+            )
+            st.write(
+                "Potential liquidity low:",
+                item.get("Liquidity Low")
+            )
+            st.write("Data status:", item["Status"])
+
+    st.caption(
+        "Signal logic uses EMA trend and recent price breaks. "
+        "FVG and liquidity levels are simplified estimates, "
+        "not a complete SMC model. This scanner does not "
+        "place trades."
+    )
+
+    st.caption(
+        "Last page refresh (UTC): "
+        + datetime.now(timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+    )
+
+except Exception as e:
+    st.error(
+        "Unable to load Delta Exchange market data. "
+        "Please refresh and try again."
+    )
+
+    st.caption(
+        "Technical details: "
+        + str(e)[:250]
+    ) 
